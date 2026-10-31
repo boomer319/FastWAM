@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""FastWAM policy server speaking the UnifoLM-WMA ZMQ protocol (G1 Dex3).
+"""FastWAM policy server for G1 Dex3 over a ZMQ action protocol.
 
-Drop-in for unifolm_wma scripts/evaluation/zmq_wma_server.py, so the existing
-clients work unchanged:
+The wire format is compatible with the UnifoLM-WMA ZMQ server
+(scripts/evaluation/zmq_wma_server.py), so these clients work unchanged:
   * the Isaac Lab sim action provider for UnifoLM-WMA
   * the real-robot UnifoLM-WMA client
 Both send `observation.images.top` (2, H, W, 3) uint8 + `observation.state`
@@ -203,7 +203,7 @@ def main():
     sock = ctx.socket(zmq.REP)
     sock.setsockopt(zmq.LINGER, 0)
     sock.bind(f"tcp://{args.zmq_host}:{args.zmq_port}")
-    logging.info("FastWAM ZMQ server ready on tcp://%s:%d (WMA protocol, single client)",
+    logging.info("FastWAM ZMQ server ready on tcp://%s:%d (ZMQ action protocol, single client)",
                  args.zmq_host, args.zmq_port)
     while True:
         req = _unpackb(sock.recv())
