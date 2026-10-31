@@ -125,6 +125,8 @@ class FastWamPolicy:
             "native_hz": 30,
             "client_hz": 30 // self.stride,
             "num_inference_steps": self.args.num_inference_steps,
+            "noise": "fixed" if self.args.fixed_noise else "per_call(seed+n)",
+            "seed": self.args.seed,
             "height": self.height,
             "width": self.width,
             "image_shape": [2, 480, 640, 3],
@@ -163,7 +165,11 @@ class FastWamPolicy:
                 proprio=proprio,
                 num_inference_steps=self.args.num_inference_steps,
                 text_cfg_scale=1.0,
-                seed=self.args.seed,
+                # per-call noise: base seed + call counter (reproducible, but a
+                # different draw every inference, as in training). With one fixed
+                # draw a bias in that draw repeats every chunk and compounds in
+                # closed loop; --fixed_noise restores the old behaviour.
+                seed=self.args.seed if self.args.fixed_noise else self.args.seed + self.n_infer,
             )
         a = pred["action"]
         if a.ndim == 2:
@@ -192,6 +198,8 @@ def main():
     p.add_argument("--num_inference_steps", type=int, default=10)   # paper / upstream deploy default
     p.add_argument("--client_stride", type=int, default=2)
     p.add_argument("--seed", type=int, default=123)
+    p.add_argument("--fixed_noise", action="store_true",
+                   help="use the same noise seed for every inference (old behaviour)")
     p.add_argument("--log_dir", default="logs/fastwam_server")
     p.add_argument("--zmq_host", default="0.0.0.0")
     p.add_argument("--zmq_port", type=int, default=5580)
