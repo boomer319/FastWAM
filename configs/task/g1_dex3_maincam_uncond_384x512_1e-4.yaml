@@ -1,0 +1,37 @@
+# @package _global_
+# FastWAM (uncond, first-frame mode) on G1 Dex3 AllMerged maincam (6 GPUs, ZeRO-2).
+# Hyper-parameters follow robotwin_uncond_3cam_384_1e-4 except where noted.
+
+defaults:
+  - override /data: g1_dex3_maincam
+  - override /model: fastwam
+  - _self_
+
+# dataloading (per-rank). G1: 16/rank OOMs on 80 GB at 384x512 (1.6x the
+# RoboTwin video tokens; upstream MoT has no gradient checkpointing), so
+# 8/rank x grad-accum 2 keeps the global batch at 6 x 8 x 2 = 96.
+batch_size: 8
+num_workers: 8
+
+model:
+  mot_checkpoint_mixed_attn: false
+
+# scheduler
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 1
+# G1: step-bounded like the paper's RoboTwin / real-world runs (30k steps);
+# one "epoch" here is every frame of 2.3M as a start index (~24k steps @ 96).
+max_steps: 30000
+log_every: 10
+save_every: 2000
+eval_every: 2000
+
+# weights-only, rotated checkpoints (a full ZeRO state is ~80+ GB per save)
+save_training_state: false
+keep_last_weights: 3
+
+# training
+gradient_accumulation_steps: 2
+weight_decay: 1e-2
+resume: null

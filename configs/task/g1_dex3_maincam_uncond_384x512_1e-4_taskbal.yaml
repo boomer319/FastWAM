@@ -1,0 +1,12 @@
+# @package _global_
+# Follow-up to g1_dex3_maincam_uncond_384x512_1e-4: identical except that
+# every instruction (12 tasks) is sampled equally often. Under the upstream
+# per-frame sampling the longest task (toaster, 15.3 % of frames) gets 3.6x
+# the gradient weight of the shortest (toothpaste + trash bag, 4.3 %), and
+# pour water only 5.3 %. One variable changed, so the two runs compare.
+
+defaults:
+  - g1_dex3_maincam_uncond_384x512_1e-4
+  - _self_
+
+sampling_balance: task
