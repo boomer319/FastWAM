@@ -20,6 +20,9 @@ num_epochs: 1
 max_steps: null
 log_every: 10
 save_every: 100
+save_training_state: true # false = weights-only checkpoints (no accelerate/ZeRO state)
+keep_last_weights: 0 # >0 = rotate weights/step_*.pt, keeping only the newest N
+sampling_balance: frame # frame (upstream) | episode | task - equal weight per frame/episode/instruction
 eval_every: 50
 eval_num_inference_steps: 10
 

@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from .utils.fs import ensure_dir
 from .utils.logging_config import get_logger, setup_logging
 from .utils.pytorch_utils import set_global_seed
-from .utils.samplers import ResumableEpochSampler
+from .utils.samplers import ResumableEpochSampler, WeightedResumableEpochSampler
 from .utils.video_io import save_mp4
 from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
 
@@ -41,6 +41,16 @@ class Wan22Trainer:
         self.max_steps = int(max_steps) if max_steps is not None else None
         self.log_every = int(cfg.log_every)
         self.save_every = int(cfg.save_every)
+        # Optional: skip the accelerate/DeepSpeed state (~80+ GB for the 6B MoT
+        # under ZeRO-1) and keep only the newest N weight files.
+        self.save_training_state = bool(cfg.get("save_training_state", True))
+        self.keep_last_weights = int(cfg.get("keep_last_weights", 0))  # 0 = keep all
+        # "frame" = upstream (every frame equally likely, so long tasks
+        # dominate); "episode" = every episode equally likely; "task" = every
+        # task (instruction) equally likely.
+        self.sampling_balance = str(cfg.get("sampling_balance", "frame")).strip().lower()
+        if self.sampling_balance not in {"frame", "episode", "task"}:
+            raise ValueError(f"Unsupported sampling_balance: {self.sampling_balance}")
         self.eval_every = int(cfg.eval_every)
         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
@@ -187,13 +197,44 @@ class Wan22Trainer:
         self.wandb_run.finish()
         self.wandb_run = None
 
+    @staticmethod
+    def _frame_sampling_weights(dataset, mode: str) -> torch.Tensor:
+        # Per-frame weights in the dataset's global index order: the
+        # MultiLeRobotDataset concatenates sub-datasets, each laid out as its
+        # selected episodes in `episodes` order (same order as the parquet
+        # load and episode_data_index).
+        lengths, groups = [], []
+        for sub in dataset.lerobot_dataset.multi_dataset._datasets:
+            episodes = sub.episodes if sub.episodes is not None else sorted(sub.meta.episodes)
+            for ep in episodes:
+                lengths.append(int(sub.meta.episodes[ep]["length"]))
+                groups.append(sub.meta.episodes[ep]["tasks"][0] if mode == "task" else (sub.repo_id, ep))
+        group_frames = {}
+        for n, g in zip(lengths, groups):
+            group_frames[g] = group_frames.get(g, 0) + n
+        weights = torch.cat([torch.full((n,), 1.0 / group_frames[g], dtype=torch.float64) for n, g in zip(lengths, groups)])
+        if len(weights) != len(dataset):
+            raise ValueError(f"sampling weights cover {len(weights)} frames, dataset has {len(dataset)}")
+        return weights
+
     def _build_loader(self, dataset, worker_init_fn=None):
-        self.train_sampler = ResumableEpochSampler(
-            dataset=dataset,
-            seed=self.seed,
-            batch_size=self.batch_size,
-            num_processes=self.accelerator.num_processes,
-        )
+        if self.sampling_balance == "frame":
+            self.train_sampler = ResumableEpochSampler(
+                dataset=dataset,
+                seed=self.seed,
+                batch_size=self.batch_size,
+                num_processes=self.accelerator.num_processes,
+            )
+        else:
+            weights = self._frame_sampling_weights(dataset, self.sampling_balance)
+            logger.info("Sampling balance=%s over %d frames", self.sampling_balance, len(weights))
+            self.train_sampler = WeightedResumableEpochSampler(
+                dataset=dataset,
+                weights=weights,
+                seed=self.seed,
+                batch_size=self.batch_size,
+                num_processes=self.accelerator.num_processes,
+            )
         return DataLoader(
             dataset,
             batch_size=self.batch_size,
@@ -610,7 +651,15 @@ class Wan22Trainer:
         ckpt_path = None
         if self.accelerator.is_main_process:
             ckpt_path = self._save_weights_checkpoint(step_tag=step_tag)
+            if self.keep_last_weights > 0:
+                old = sorted(Path(self.weights_dir).glob("step_*.pt"))[: -self.keep_last_weights]
+                for p in old:
+                    p.unlink()
+                    logger.info("[ckpt] rotated out %s", p)
         self.accelerator.wait_for_everyone()
+
+        if not self.save_training_state:
+            return {"weights_path": ckpt_path, "state_path": None}
 
         state_path = os.path.join(self.state_dir, step_tag)
         ensure_dir(state_path)
