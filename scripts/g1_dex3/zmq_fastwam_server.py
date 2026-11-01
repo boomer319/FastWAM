@@ -111,7 +111,7 @@ class FastWamPolicy:
         self.n_infer = 0
         # optional camera remap: grid (H, W, 2) in [-1, 1] for grid_sample, applied to the raw frame
         self.warp = None
-        if args.image_warp:
+        if getattr(args, "image_warp", ""):          # absent when reused by ablation_input.py
             g = np.load(args.image_warp)["grid"].astype(np.float32)
             self.warp = torch.from_numpy(g).unsqueeze(0)
             logging.info("image warp %s, grid %s", args.image_warp, tuple(g.shape))
@@ -136,7 +136,7 @@ class FastWamPolicy:
             "height": self.height,
             "width": self.width,
             "image_shape": [2, 480, 640, 3],
-            "image_warp": self.args.image_warp or None,
+            "image_warp": getattr(self.args, "image_warp", "") or None,
             "note": "reply action = (video_length, 28) at client_hz; action_30hz = full chunk",
         }
 
