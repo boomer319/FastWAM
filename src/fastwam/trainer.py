@@ -127,6 +127,16 @@ class Wan22Trainer:
         ensure_dir(self.state_dir)
         ensure_dir(self.eval_dir)
 
+        # A weights-only checkpoint must be loaded BEFORE accelerator.prepare(): under DeepSpeed
+        # ZeRO-2 the optimizer keeps fp32 master copies created at prepare() time, and the first
+        # optimizer step writes them back into the module. Loading after prepare() is silently
+        # undone by that first step (seen 2026-11-01: loss_action 2.1 right after "loading" 30k).
+        self._weights_preloaded = False
+        if self.resume and Path(str(self.resume)).is_file():
+            logger.info("Loading weight checkpoint before DeepSpeed init: %s", self.resume)
+            self.model.load_checkpoint(str(self.resume), optimizer=None)
+            self._weights_preloaded = True
+
         if bool(getattr(self.model, "compile_training_denoise", False)):
             logger.info("Compiling training denoise forward/backward before DeepSpeed initialization.")
             compile_start = time.perf_counter()
@@ -337,6 +347,9 @@ class Wan22Trainer:
             return
         if not resume_path.exists():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume}")
+        if self._weights_preloaded:
+            logger.info("Weights-only checkpoint already loaded before DeepSpeed init; fresh optimizer/scheduler/step.")
+            return
         logger.info("Loading weight checkpoint only: %s", resume)
         self.accelerator.unwrap_model(self.model).load_checkpoint(str(resume_path), optimizer=None)
         logger.warning("Loaded .pt weights only; optimizer/scheduler/step were not restored under ZeRO2.")
