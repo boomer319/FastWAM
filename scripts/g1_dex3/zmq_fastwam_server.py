@@ -109,6 +109,12 @@ class FastWamPolicy:
         self.log_path = Path(args.log_dir) / "infer_log.jsonl"
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.n_infer = 0
+        # optional camera remap: grid (H, W, 2) in [-1, 1] for grid_sample, applied to the raw frame
+        self.warp = None
+        if args.image_warp:
+            g = np.load(args.image_warp)["grid"].astype(np.float32)
+            self.warp = torch.from_numpy(g).unsqueeze(0)
+            logging.info("image warp %s, grid %s", args.image_warp, tuple(g.shape))
 
     def metadata(self) -> dict:
         return {
@@ -130,6 +136,7 @@ class FastWamPolicy:
             "height": self.height,
             "width": self.width,
             "image_shape": [2, 480, 640, 3],
+            "image_warp": self.args.image_warp or None,
             "note": "reply action = (video_length, 28) at client_hz; action_30hz = full chunk",
         }
 
@@ -138,6 +145,9 @@ class FastWamPolicy:
         if img.shape[0] == 3 and img.shape[-1] != 3:      # (3, H, W) -> (H, W, 3)
             img = np.transpose(img, (1, 2, 0))
         x = torch.from_numpy(np.ascontiguousarray(img[..., :3])).permute(2, 0, 1).float() / 255.0
+        if self.warp is not None and tuple(self.warp.shape[1:3]) == tuple(x.shape[-2:]):
+            x = torch.nn.functional.grid_sample(x.unsqueeze(0), self.warp, mode="bilinear",
+                                                padding_mode="border", align_corners=False)[0]
         h, w = x.shape[-2:]
         scale = max(self.height / h, self.width / w)
         x = TF.resize(x, [round(h * scale), round(w * scale)], antialias=True)
@@ -200,6 +210,9 @@ def main():
     p.add_argument("--seed", type=int, default=123)
     p.add_argument("--fixed_noise", action="store_true",
                    help="use the same noise seed for every inference (old behaviour)")
+    p.add_argument("--image_warp", default="",
+                   help="npz with 'grid' (H, W, 2) in [-1, 1]: remap the raw frame before preprocessing "
+                        "(e.g. to emulate a different camera focal length / distortion / rotation)")
     p.add_argument("--log_dir", default="logs/fastwam_server")
     p.add_argument("--zmq_host", default="0.0.0.0")
     p.add_argument("--zmq_port", type=int, default=5580)
