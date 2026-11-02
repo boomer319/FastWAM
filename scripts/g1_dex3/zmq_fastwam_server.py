@@ -253,6 +253,12 @@ class FastWamPolicy:
                  "desc": "success", "latency_s": latency}
         if attn is not None:
             reply["attn_map"] = attn
+            if self.args.attn_frames:     # model input frame per chunk, for offline overlays (~3 ms JPEG)
+                from PIL import Image
+                d = self.log_path.parent / "attn_frames"
+                d.mkdir(exist_ok=True)
+                rgb = ((image[0].permute(1, 2, 0).numpy() + 1) * 127.5).clip(0, 255).astype(np.uint8)
+                Image.fromarray(rgb).save(d / f"{self.n_infer:05d}.jpg", quality=90)
         return reply
 
 
@@ -273,6 +279,8 @@ def main():
     p.add_argument("--attn_map", action="store_true",
                    help="return the early-layer action->image attention map (12x16) with every chunk")
     p.add_argument("--attn_layers", type=int, default=10, help="layers 0..N-1 averaged for --attn_map")
+    p.add_argument("--attn_frames", action="store_true",
+                   help="with --attn_map: save each chunk's model input frame to <log_dir>/attn_frames/<n>.jpg")
     p.add_argument("--log_dir", default="logs/fastwam_server")
     p.add_argument("--zmq_host", default="0.0.0.0")
     p.add_argument("--zmq_port", type=int, default=5580)
