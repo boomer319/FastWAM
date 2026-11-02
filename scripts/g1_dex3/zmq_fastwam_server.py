@@ -26,6 +26,14 @@ Model side (first-frame "uncond" FastWAM, as trained):
 
 Every infer is appended to <log_dir>/infer_log.jsonl (latency, prompt,
 state, chunk) for offline analysis; metadata reports the checkpoint sha256.
+
+Optional --attn_map: the reply also carries `attn_map` (12, 16) float32, the
+action tokens' attention to the first-frame video tokens (one cell ~ 32x32 px
+of the 384x512 model input), mean over the early layers (0..attn_layers-1),
+heads, queries and denoising steps, normalised to sum 1. Recomputed next to
+the fused attention call (output unchanged), accumulated on the GPU, one copy
+per chunk. Early layers only: later layers park their attention on a
+content-free sink token (doc: attention_probe.py). Clients ignore the key.
 """
 import argparse
 import functools
@@ -47,6 +55,7 @@ from omegaconf import OmegaConf
 
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
+import fastwam.models.wan22.mot as mot_mod
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [zmq_fastwam_server] %(message)s")
 
@@ -75,6 +84,41 @@ def _unpack_array(obj):
 
 _packer = functools.partial(msgpack.Packer, default=_pack_array)
 _unpackb = functools.partial(msgpack.unpackb, object_hook=_unpack_array)
+
+
+class LiveAttention:
+    """Wraps mot.flash_attention; sums early-layer action->video attention on the GPU."""
+
+    def __init__(self, n_layers: int, early: int, n_video: int, n_action: int):
+        self.n_layers, self.early, self.n_video, self.n_action = n_layers, early, n_video, n_action
+        self.enabled = True
+        self._orig = mot_mod.flash_attention
+        self.reset()
+
+    def reset(self):
+        self.calls, self.acc = 0, None
+
+    def __call__(self, q, k, v, num_heads, ctx_mask=None, compatibility_mode=True):
+        out = self._orig(q, k, v, num_heads, ctx_mask=ctx_mask, compatibility_mode=compatibility_mode)
+        if self.enabled and q.shape[1] == self.n_action and k.shape[1] == self.n_video + self.n_action:
+            layer = self.calls % self.n_layers                  # calls run step-major, layer-minor
+            self.calls += 1
+            if layer < self.early:
+                b, sq, hd = q.shape
+                d = hd // num_heads
+                qh = q.view(b, sq, num_heads, d).transpose(1, 2)
+                kh = k.view(b, k.shape[1], num_heads, d).transpose(1, 2)
+                logits = (qh @ kh.transpose(-1, -2)).float() / d ** 0.5
+                if ctx_mask is not None and ctx_mask.dtype == torch.bool:
+                    logits = logits.masked_fill(~ctx_mask.to(logits.device), float("-inf"))
+                w = logits.softmax(-1)[..., : self.n_video].sum(dim=(0, 1, 2))   # [Sv]
+                self.acc = w if self.acc is None else self.acc + w
+        return out
+
+    def take(self, grid) -> np.ndarray:
+        m = self.acc.cpu().numpy().astype(np.float32)          # the one device->host copy per chunk
+        self.reset()
+        return (m / m.sum()).reshape(grid)
 
 
 def _sha256(path: str) -> str:
@@ -115,6 +159,13 @@ class FastWamPolicy:
             g = np.load(args.image_warp)["grid"].astype(np.float32)
             self.warp = torch.from_numpy(g).unsqueeze(0)
             logging.info("image warp %s, grid %s", args.image_warp, tuple(g.shape))
+        self.attn = None
+        self.attn_grid = (self.height // 32, self.width // 32)  # VAE 16x, patch 2x2
+        if getattr(args, "attn_map", False):
+            self.attn = LiveAttention(self.model.mot.num_layers, args.attn_layers,
+                                      self.attn_grid[0] * self.attn_grid[1], self.horizon)
+            mot_mod.flash_attention = self.attn
+            logging.info("attn_map on: layers 0..%d, grid %s", args.attn_layers - 1, self.attn_grid)
 
     def metadata(self) -> dict:
         return {
@@ -137,6 +188,7 @@ class FastWamPolicy:
             "width": self.width,
             "image_shape": [2, 480, 640, 3],
             "image_warp": getattr(self.args, "image_warp", "") or None,
+            "attn_map": None if self.attn is None else {"grid": list(self.attn_grid), "layers": self.args.attn_layers},
             "note": "reply action = (video_length, 28) at client_hz; action_30hz = full chunk",
         }
 
@@ -187,6 +239,7 @@ class FastWamPolicy:
         norm = self.processor.normalizer.normalizers["action"][self.action_key]
         chunk30 = norm.backward(a.to(dtype=torch.float32, device="cpu"))[0].numpy().astype(np.float32)
         chunk = np.ascontiguousarray(chunk30[:: self.stride])
+        attn = self.attn.take(self.attn_grid) if self.attn is not None and self.attn.acc is not None else None
         latency = round(time.time() - t0, 3)
         self.n_infer += 1
         with open(self.log_path, "a") as f:
@@ -194,9 +247,13 @@ class FastWamPolicy:
                 "t": time.time(), "n": self.n_infer, "latency_s": latency, "prompt": instr,
                 "state": np.asarray(payload["observation.state"], dtype=np.float32)[-1].tolist(),
                 "action_30hz": chunk30.tolist(),
+                **({"attn_map": np.round(attn, 5).tolist()} if attn is not None else {}),
             }) + "\n")
-        return {"result": "ok", "action": chunk, "action_30hz": chunk30,
-                "desc": "success", "latency_s": latency}
+        reply = {"result": "ok", "action": chunk, "action_30hz": chunk30,
+                 "desc": "success", "latency_s": latency}
+        if attn is not None:
+            reply["attn_map"] = attn
+        return reply
 
 
 def main():
@@ -213,6 +270,9 @@ def main():
     p.add_argument("--image_warp", default="",
                    help="npz with 'grid' (H, W, 2) in [-1, 1]: remap the raw frame before preprocessing "
                         "(e.g. to emulate a different camera focal length / distortion / rotation)")
+    p.add_argument("--attn_map", action="store_true",
+                   help="return the early-layer action->image attention map (12x16) with every chunk")
+    p.add_argument("--attn_layers", type=int, default=10, help="layers 0..N-1 averaged for --attn_map")
     p.add_argument("--log_dir", default="logs/fastwam_server")
     p.add_argument("--zmq_host", default="0.0.0.0")
     p.add_argument("--zmq_port", type=int, default=5580)
